@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+reports/*.png
+mlruns/
+!mlruns/.gitkeep
+*.egg-info/
+.DS_Store
