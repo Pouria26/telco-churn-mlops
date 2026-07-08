@@ -12,7 +12,7 @@
 
 ## Demo
 
-https://github.com/user-attachments/assets/demo-video.mp4
+https://github.com/user-attachments/assets/6420a19e-64c9-4eb1-bb47-26a888b56c30
 
 Alternative: If the video above doesn't render, you can also view it directly:
 
