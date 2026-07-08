@@ -1,15 +1,11 @@
 """
 mlflow_utils.py
 ---------------
-Thin wrapper around MLflow so that train.py / evaluate.py never call
-mlflow.* directly. Keeping this in one place makes it trivial to change
-the tracking backend later (e.g. sqlite -> a remote MLflow server) without
-touching training code.
+MLflow wrapper. Saves models via joblib + log_artifact (works with MLflow 3.14 + SQLite).
 """
 
-import os
-import mlflow
-import mlflow.lightgbm
+import os, tempfile, mlflow, joblib
+import matplotlib.pyplot as plt
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MLFLOW_DIR = os.path.join(PROJECT_ROOT, "mlruns")
@@ -18,9 +14,9 @@ EXPERIMENT_NAME = "Telco_Churn_Prediction"
 
 def setup_mlflow(experiment_name: str = EXPERIMENT_NAME):
     os.makedirs(MLFLOW_DIR, exist_ok=True)
-    mlflow.set_tracking_uri(f"sqlite:///{os.path.abspath(MLFLOW_DIR)}/mlflow.db")
+    db_path = os.path.abspath(os.path.join(MLFLOW_DIR, "mlflow.db"))
+    mlflow.set_tracking_uri(f"sqlite:///{db_path}")
     mlflow.set_experiment(experiment_name)
-    print(f"[mlflow_utils] tracking_uri={mlflow.get_tracking_uri()} experiment={experiment_name}")
 
 
 def start_run(run_name: str):
@@ -28,7 +24,6 @@ def start_run(run_name: str):
 
 
 def log_params_clean(params: dict):
-    """MLflow only accepts primitive types as param values; stringify anything else."""
     clean = {}
     for k, v in params.items():
         clean[k] = v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
@@ -46,17 +41,18 @@ def log_confusion_matrix(cm):
     mlflow.log_metric("test_cm_tp", int(cm[1, 1]))
 
 
+def log_figure(figure, artifact_name: str):
+    mlflow.log_figure(figure, artifact_name)
+    plt.close(figure)
+
+
 def log_model(model, model_type: str, artifact_name: str):
-    if model_type == "sklearn":
-        mlflow.sklearn.log_model(sk_model=model, name=artifact_name)
-    elif model_type == "xgboost":
-        mlflow.xgboost.log_model(xgb_model=model, name=artifact_name)
-    elif model_type == "catboost":
-        mlflow.catboost.log_model(cb_model=model, name=artifact_name)
-    elif model_type == "lightgbm": 
-        mlflow.lightgbm.log_model(lgb_model=model, name=artifact_name)
-    else:
-        raise ValueError(f"Unknown model_type '{model_type}'")
+    """Save model with joblib and log as MLflow artifact."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "model.joblib")
+        joblib.dump(model, path)
+        mlflow.log_artifacts(tmp, artifact_path=artifact_name)
+    print(f"  [mlflow_utils] Model saved as artifact: {artifact_name}")
 
 
 def get_active_run_id() -> str:
@@ -64,7 +60,6 @@ def get_active_run_id() -> str:
 
 
 def get_best_run(experiment_name: str = EXPERIMENT_NAME, metric: str = "test_f1"):
-    """Return the mlflow run with the highest value of `metric` in the given experiment."""
     setup_mlflow(experiment_name)
     exp = mlflow.get_experiment_by_name(experiment_name)
     runs = mlflow.search_runs(experiment_ids=[exp.experiment_id], order_by=[f"metrics.{metric} DESC"])
