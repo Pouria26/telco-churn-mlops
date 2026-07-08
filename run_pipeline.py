@@ -2,7 +2,7 @@
 run_pipeline.py
 ---------------
 Single, reproducible entrypoint for the whole MLOps pipeline.
-Supports automated data building, specific model training, and CLTV regression tracking.
+Supports Churn classification and CLTV value classification (Low/High).
 
 Author: Machine Learning Course Project (Dr. Bahaghighat)
 """
@@ -27,7 +27,6 @@ ALL_VERSIONS = ["v2", "v3"]
 def load_data(version: str, rebuild: bool = False) -> pd.DataFrame:
     """
     Loads a dataset version from disk, building it from raw data if missing or forced.
-    Ensures that for CLTV tasks on v2, the target column is dynamically recovered.
     """
     if not rebuild and data_loader.version_exists(version):
         df = data_loader.load_version(version)
@@ -47,51 +46,46 @@ def load_data(version: str, rebuild: bool = False) -> pd.DataFrame:
     return df
 
 
-def handle_cltv_target(df: pd.DataFrame, version: str) -> pd.DataFrame:
-    """
-    Passes the dataframe cleanly. The comprehensive cltv pipeline 
-    independently handles full features internally.
-    """
-    return df
-
 def main():
-    # Setup custom formatter to make the help description look clean and professional
     parser = argparse.ArgumentParser(
-        description="🚀 End-to-End MLOps Pipeline for Telco Customer Churn & CLTV Prediction 🚀",
+        description="End-to-End MLOps Pipeline for Telco Customer Churn & CLTV Prediction",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples of Usage:
 ------------------
-1. Run all models on all available dataset versions (v2 and v3):
+1. Run Churn classification on all dataset versions (v2 and v3):
    python run_pipeline.py
 
-2. Run all models ONLY on dataset version v3:
+2. Run Churn classification ONLY on v3:
    python run_pipeline.py --version v3
 
-3. Force rebuild v2 and v3 datasets from raw v1 Excel, then run pipeline:
+3. Force rebuild v2/v3 datasets from raw Excel, then run:
    python run_pipeline.py --rebuild-data
 
-4. Train ONLY a specific model (e.g., Random Forest) on version v3:
+4. Train ONLY a specific model (e.g., Random Forest) on v3:
    python run_pipeline.py --version v3 --model "Random Forest"
 
-5. Run the CLTV Regression Pipeline on version v3:
-   python run_pipeline.py --mode cltv --version v3
+5. Run CLTV classification (Low/High Value) on all versions:
+   python run_pipeline.py --mode cltv_class
 
-6. Run the CLTV Regression Pipeline on version v2 (automatically restores CLTV column):
-   python run_pipeline.py --mode cltv --version v2
+6. Run CLTV classification on v3 only:
+   python run_pipeline.py --mode cltv_class --version v3
+
+7. Run CLTV classification with a specific model:
+   python run_pipeline.py --mode cltv_class --model "XGBoost"
         """
     )
 
     # Core Pipeline Arguments
     parser.add_argument(
-        "--version", 
-        choices=ALL_VERSIONS, 
+        "--version",
+        choices=ALL_VERSIONS,
         default=None,
         help="Specify a single dataset version to run. If not set, runs all versions sequentially."
     )
-    
+
     parser.add_argument(
-        "--rebuild-data", 
+        "--rebuild-data",
         action="store_true",
         help="Force the preprocessing and feature engineering steps to rebuild v2/v3 from raw v1."
     )
@@ -100,14 +94,18 @@ Examples of Usage:
         "--model",
         type=str,
         default=None,
-        help="Filter pipeline to train ONLY a specific model. \nChoices: 'Logistic Regression', 'Random Forest', 'XGBoost', 'CatBoost', 'Gradient Boosting', 'AdaBoost', 'LightGBM'"
+        help="Train ONLY a specific model.\n"
+             "Choices: 'Logistic Regression', 'Random Forest', 'XGBoost', 'CatBoost',\n"
+             "         'Gradient Boosting', 'AdaBoost', 'LightGBM', 'Voting Ensemble'"
     )
 
     parser.add_argument(
         "--mode",
-        choices=["churn", "cltv"],
+        choices=["churn", "cltv_class"],
         default="churn",
-        help="Execution objective:\n'churn' -> Classification pipeline to predict customer drops (Default).\n'cltv'  -> Regression pipeline to predict Customer Lifetime Value."
+        help="Execution mode (default: churn):\n"
+             "  churn      -> Churn classification (predict if customer will leave)\n"
+             "  cltv_class -> CLTV classification (predict Low/High value customer)"
     )
 
     args = parser.parse_args()
@@ -121,29 +119,20 @@ Examples of Usage:
     print("=" * 60)
 
     # Execute Pipeline based on selected mode
-    if args.mode == "cltv":
-        # Import dynamically or safely invoke your new CLTV module logic
+    if args.mode == "cltv_class":
         try:
-            from src import cltv
+            from src import cltv_class
         except ImportError:
-            print("[run_pipeline] ❌ Error: 'src.cltv' module not found. Please create 'src/cltv.py' first.")
+            print("[run_pipeline] Error: 'src.cltv_class' module not found.")
             return
+        for version in versions:
+            df = load_data(version, rebuild=args.rebuild_data)
+            cltv_class.train_dataset_version(version, df, target_model=args.model)
 
-        for version in versions:
-            df = load_data(version, rebuild=args.rebuild_data)
-            # Address data requirements specific to CLTV
-            df = handle_cltv_target(df, version)
-            
-            # Execute the regression pipeline
-            cltv.train_cltv_regression(df, version=version, target_model=args.model)
-            
     else:
-        # Standard Churn Classification Mode (Includes your original logic)
+        # Standard Churn Classification Mode
         for version in versions:
             df = load_data(version, rebuild=args.rebuild_data)
-            
-            # Run training. Modified to pass 'args.model' directly down to train.py
-            # If args.model is provided, train.py handles filtering the dictionary internally.
             result = train.train_dataset_version(version, df, target_model=args.model)
             all_results.append(result)
 
