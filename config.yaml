@@ -16,31 +16,71 @@ data:
 
 models:
   logistic_regression:
-    max_iter: 800
+    max_iter: 1000
     class_weight: "balanced"
   random_forest:
-    n_estimators: 600
-    max_depth: 12
-    min_samples_split: 10
-    min_samples_leaf: 5
+    n_estimators: 1000
+    max_depth: 10
+    min_samples_split: 8
+    min_samples_leaf: 4
   xgboost:
-    n_estimators: 500
-    max_depth: 5
-    learning_rate: 0.07
-    subsample: 0.6
-    colsample_bytree: 0.6
+    n_estimators: 800
+    max_depth: 4
+    learning_rate: 0.03
+    subsample: 0.8
+    colsample_bytree: 0.7
   catboost:
-    iterations: 500
-    depth: 8
-    learning_rate: 0.1
+    iterations: 800
+    depth: 6
+    learning_rate: 0.05
   gradient_boosting:
-    n_estimators: 200
-    learning_rate: 0.15
-    max_depth: 6
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 5
   adaboost:
-    n_estimators: 200
+    n_estimators: 300
     learning_rate: 0.1
   lightgbm:
-    n_estimators: 500
-    learning_rate: 0.05
-    max_depth: 6
+    n_estimators: 800
+    learning_rate: 0.03
+    max_depth: 5
+    num_leaves: 31
+    min_child_samples: 20
+
+cltv_regression:
+  target_transform: "log1p"
+  test_size: 0.15
+  val_size: 0.15
+  cv_folds: 5
+  models:
+    lightgbm:
+      n_estimators: 1500
+      learning_rate: 0.02
+      max_depth: 6
+      num_leaves: 50
+      subsample: 0.7
+      colsample_bytree: 0.7
+      reg_alpha: 0.5
+      reg_lambda: 0.5
+    xgboost:
+      n_estimators: 1500
+      learning_rate: 0.02
+      max_depth: 5
+      subsample: 0.7
+      colsample_bytree: 0.7
+      reg_alpha: 0.5
+      reg_lambda: 0.5
+    catboost:
+      iterations: 1500
+      depth: 6
+      learning_rate: 0.03
+      l2_leaf_reg: 5
+    random_forest:
+      n_estimators: 1000
+      max_depth: 15
+      min_samples_split: 5
+      min_samples_leaf: 3
+
+streamlit:
+  title: "Telco Customer Churn & CLTV Prediction"
+  port: 8501

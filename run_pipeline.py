@@ -49,39 +49,10 @@ def load_data(version: str, rebuild: bool = False) -> pd.DataFrame:
 
 def handle_cltv_target(df: pd.DataFrame, version: str) -> pd.DataFrame:
     """
-    Ensures the CLTV column exists in the dataset. If it's missing (like in v2/v3),
-    it safely recovers it from raw v1 data by removing the same 11 rows where
-    'Total Charges' was missing, perfectly aligning the sequences without needing CustomerID.
+    Passes the dataframe cleanly. The comprehensive cltv pipeline 
+    independently handles full features internally.
     """
-    df = df.copy()
-    if "CLTV" in df.columns:
-        return df
-
-    print(f"[run_pipeline] ⚠️ 'CLTV' column not found in {version}. Recovering from raw v1 data...")
-    try:
-        # 1. Load the untouched raw v1 dataset
-        df_raw = data_loader.load_raw_data()
-        
-        # 2. Replicate the row filtering logic (dropping the 11 empty Total Charges rows)
-        if df_raw["Total Charges"].dtype == object:
-            df_raw["Total Charges"] = pd.to_numeric(df_raw["Total Charges"], errors="coerce")
-        df_raw_clean = df_raw.dropna(subset=["Total Charges"])
-        
-        # 3. Check if we can align safely by matching lengths
-        if len(df) == len(df_raw_clean):
-            print(f"[run_pipeline] ✅ Length matches perfectly ({len(df)} rows). Aligning CLTV target column...")
-            df["CLTV"] = df_raw_clean["CLTV"].values
-            return df
-        else:
-            # Fallback alignment in case data shape differs
-            print(f"[run_pipeline] ⚠️ Length mismatch (DF: {len(df)}, Raw Cleaned: {len(df_raw_clean)}). Using index fallback.")
-            df["CLTV"] = df_raw_clean["CLTV"].reset_index(drop=True).iloc[:len(df)].values
-            return df
-            
-    except Exception as e:
-        print(f"[run_pipeline] ❌ Error recovering CLTV column inside run_pipeline: {e}")
-        sys.exit(1)
-
+    return df
 
 def main():
     # Setup custom formatter to make the help description look clean and professional
@@ -164,7 +135,7 @@ Examples of Usage:
             df = handle_cltv_target(df, version)
             
             # Execute the regression pipeline
-            cltv.train_cltv_regression(df, version=version)
+            cltv.train_cltv_regression(df, version=version, target_model=args.model)
             
     else:
         # Standard Churn Classification Mode (Includes your original logic)
@@ -178,15 +149,23 @@ Examples of Usage:
 
         # Build and print the leaderboard if we ran the full classification loop
         if all_results and not args.model:
-            leaderboard = evaluate.build_leaderboard(
-                [{"dataset_version": r["dataset_version"], "model": r["model"], "test_f1": r["test_f1"]}
-                 for r in all_results]
-            )
-            print("\n" + "=" * 60)
-            print("FINAL LEADERBOARD ACROSS ALL RUNS:")
-            print("=" * 60)
-            print(leaderboard.to_string())
-            print("=" * 60 + "\n")
+            rows = []
+            for r in all_results:
+                rows.append({
+                    "dataset_version": r.get("dataset_version", "?"),
+                    "model": r.get("model", "?"),
+                    "cv_f1": r.get("cv_f1", 0),
+                    "cv_thr_f1": r.get("cv_thr_f1", 0),
+                    "test_f1": r.get("test_f1", 0),
+                    "test_acc": r.get("test_accuracy", 0),
+                })
+            import pandas as pd
+            leaderboard = pd.DataFrame(rows)
+            print("\n" + "=" * 70)
+            print("FINAL LEADERBOARD")
+            print("=" * 70)
+            print(leaderboard.to_string(index=False))
+            print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
