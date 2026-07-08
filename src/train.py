@@ -1,258 +1,209 @@
 """
-train.py
---------
-Owns everything related to *modeling*: the sklearn preprocessing
-ColumnTransformer, the candidate model configurations, the
-train/validation/test split, cross-validation, and the full
-train -> validate -> (single) test evaluation cycle, with every run
-logged to MLflow through mlflow_utils.
-
-Design follows the professor's explicit requirement:
-    - Several CV rounds on TRAIN to keep results stable.
-    - VALIDATION is used to pick the best model / hyperparameters.
-    - TEST is evaluated exactly ONCE, only for the final chosen model,
-      and that is the number reported for this dataset version.
+train.py - Churn classification.
+Runs 8 models, picks best, saves model locally + MLflow metrics/charts.
 """
-
-import time
-import numpy as np
-import pandas as pd
-import yaml
+import time, json, os, numpy as np, pandas as pd, yaml, warnings, joblib
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, cross_val_predict, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier, VotingClassifier
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, roc_auc_score, confusion_matrix
+import xgboost as xgb, catboost as cb, lightgbm as lgb
+from src import mlflow_utils, evaluate, data_loader
 
-import xgboost as xgb
-import catboost as cb
-import lightgbm as lgb
-
-from src import mlflow_utils
-from src import evaluate
-import warnings
-
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-
-RANDOM_SEED = 42
-TARGET_COL = "Churn Value"
-
-# Columns that keep their original (already 0/1 or already-ordinal) encoding untouched;
-# everything else gets median-imputed + standard-scaled.
-PASSTHROUGH_FEATURES = [
-    "Gender", "Senior Citizen", "Partner", "Dependents",
-    "Phone Service", "Contract", "Paperless Billing",
-]
-
-with open("config.yaml", "r") as f:
+warnings.filterwarnings("ignore")
+with open("config.yaml") as f:
     config = yaml.safe_load(f)
-
 RANDOM_SEED = config["globals"]["random_seed"]
 TARGET_COL = config["globals"]["target_col"]
-PASSTHROUGH_FEATURES = config["data"]["passthrough_features"]
+MODELS_DIR = "models"
 
-def build_preprocessor(df: pd.DataFrame, target_col: str = "Churn Value"):
-    df = df.copy()
-    y = df[target_col]
-    X = df.drop(columns=[target_col])
 
-    passthrough = [c for c in PASSTHROUGH_FEATURES if c in X.columns]
-    passthrough_pipeline = Pipeline([("imputer", SimpleImputer(strategy="most_frequent"))])
-    remainder_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
+def load_version_data(version):
+    df = data_loader.load_version(version)
+    y = df[TARGET_COL].values
+    X = df.drop(columns=[TARGET_COL])
+    return X, y
+
+
+def build_preprocessor_v2(X):
+    return Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())])
+
+
+def build_preprocessor_v3(X):
+    passthrough = ["Gender", "Senior Citizen", "Partner", "Dependents", "Phone Service", "Contract", "Paperless Billing"]
+    passthrough = [c for c in passthrough if c in X.columns]
+    remainder_cols = [c for c in X.columns if c not in passthrough]
+    return ColumnTransformer([
+        ("keep", Pipeline([("imp", SimpleImputer(strategy="most_frequent"))]), passthrough),
+        ("rest", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]), remainder_cols),
     ])
 
-    preprocessor = ColumnTransformer(
-        transformers=[("keep_as_is", passthrough_pipeline, passthrough)],
-        remainder=remainder_pipeline,
-    )
-    return X, y, preprocessor
+
+def find_best_threshold(y_true, y_prob):
+    best_t, best_f1 = 0.5, 0
+    for t in np.arange(0.15, 0.85, 0.005):
+        f1 = f1_score(y_true, (y_prob >= t).astype(int), zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    return best_t, best_f1
 
 
-def split_train_val_test(X, y, test_size=0.15, val_size=0.15, is_regression=False):
-    """
-    Splits the data into Train, Validation, and Test sets.
-    Disables stratification if it's a regression task (like CLTV).
-    """
-    stratify_target = None if is_regression else y
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=RANDOM_SEED, 
-                                                        stratify=stratify_target)
-    adjusted_val_size = val_size / (1.0 - test_size)
-    stratify_target_val = None if is_regression else y_train
-
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train,  test_size=adjusted_val_size, 
-                                                      random_state=RANDOM_SEED, stratify=stratify_target_val)
-    
-    return X_train, X_val, X_test, y_train, y_val, y_test
-
-
-def get_model_configs(y_train) -> dict:
-    scale_pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
-    cfg_m = config["models"]
-    
+def get_all_models(spw):
     return {
-        "Logistic Regression": {
-            "model": LogisticRegression(max_iter=cfg_m["logistic_regression"]["max_iter"], random_state=RANDOM_SEED, class_weight=cfg_m["logistic_regression"]["class_weight"]),
-            "type": "sklearn",
-        },
-        "Random Forest": {
-            "model": RandomForestClassifier(
-                n_estimators=cfg_m["random_forest"]["n_estimators"], max_depth=cfg_m["random_forest"]["max_depth"],
-                min_samples_split=cfg_m["random_forest"]["min_samples_split"], min_samples_leaf=cfg_m["random_forest"]["min_samples_leaf"],
-                max_features="sqrt", random_state=RANDOM_SEED, n_jobs=-1, class_weight="balanced_subsample",
-            ),
-            "type": "sklearn",
-        },
-        "XGBoost": {
-            "model": xgb.XGBClassifier(
-                n_estimators=cfg_m["xgboost"]["n_estimators"], max_depth=cfg_m["xgboost"]["max_depth"], learning_rate=cfg_m["xgboost"]["learning_rate"],
-                subsample=cfg_m["xgboost"]["subsample"], colsample_bytree=cfg_m["xgboost"]["colsample_bytree"], scale_pos_weight=scale_pos_weight,
-                random_state=RANDOM_SEED, eval_metric="logloss",
-            ),
-            "type": "xgboost",
-        },
-        "CatBoost": {
-            "model": cb.CatBoostClassifier(
-                iterations=cfg_m["catboost"]["iterations"], depth=cfg_m["catboost"]["depth"],
-                learning_rate=cfg_m["catboost"]["learning_rate"],
-                auto_class_weights="Balanced", random_seed=RANDOM_SEED, verbose=0,
-                allow_writing_files=False
-            ),
-            "type": "catboost",
-        },
-        "Gradient Boosting": {
-            "model": GradientBoostingClassifier(
-                n_estimators=cfg_m["gradient_boosting"]["n_estimators"], learning_rate=cfg_m["gradient_boosting"]["learning_rate"],
-                max_depth=cfg_m["gradient_boosting"]["max_depth"], random_state=RANDOM_SEED
-            ),
-            "type": "sklearn"
-        },
-        "AdaBoost": {
-            "model": AdaBoostClassifier(
-                n_estimators=cfg_m["adaboost"]["n_estimators"], learning_rate=cfg_m["adaboost"]["learning_rate"], random_state=RANDOM_SEED
-            ),
-            "type": "sklearn"
-        },
-        "LightGBM": {
-            "model": lgb.LGBMClassifier(
-                n_estimators=cfg_m["lightgbm"]["n_estimators"], learning_rate=cfg_m["lightgbm"]["learning_rate"],
-                max_depth=cfg_m["lightgbm"]["max_depth"], random_state=RANDOM_SEED, class_weight="balanced",
-                n_jobs=-1, verbosity=-1
-            ),
-            "type": "lightgbm" 
-        }
+        "Logistic Regression": LogisticRegression(max_iter=2000, C=0.5, class_weight="balanced", random_state=RANDOM_SEED),
+        "Random Forest": RandomForestClassifier(n_estimators=1500, max_depth=12, min_samples_split=5, min_samples_leaf=3, class_weight="balanced_subsample", random_state=RANDOM_SEED, n_jobs=-1),
+        "XGBoost": xgb.XGBClassifier(n_estimators=1500, max_depth=5, learning_rate=0.02, subsample=0.8, colsample_bytree=0.7, scale_pos_weight=spw, reg_alpha=0.1, reg_lambda=1.0, random_state=RANDOM_SEED, eval_metric="logloss"),
+        "CatBoost": cb.CatBoostClassifier(iterations=1500, depth=6, learning_rate=0.03, l2_leaf_reg=5, auto_class_weights="Balanced", random_seed=RANDOM_SEED, verbose=0),
+        "Gradient Boosting": GradientBoostingClassifier(n_estimators=500, learning_rate=0.05, max_depth=5, random_state=RANDOM_SEED),
+        "AdaBoost": AdaBoostClassifier(n_estimators=500, learning_rate=0.1, random_state=RANDOM_SEED),
+        "LightGBM": lgb.LGBMClassifier(n_estimators=1500, learning_rate=0.02, max_depth=6, num_leaves=40, min_child_samples=20, subsample=0.8, colsample_bytree=0.7, class_weight="balanced", random_state=RANDOM_SEED, n_jobs=-1, verbosity=-1),
+        "Voting Ensemble": VotingClassifier(estimators=[
+            ("lr", LogisticRegression(max_iter=2000, C=0.5, class_weight="balanced", random_state=RANDOM_SEED)),
+            ("rf", RandomForestClassifier(n_estimators=1000, max_depth=12, min_samples_split=5, min_samples_leaf=3, class_weight="balanced_subsample", random_state=RANDOM_SEED, n_jobs=-1)),
+            ("xgb", xgb.XGBClassifier(n_estimators=1000, max_depth=5, learning_rate=0.03, subsample=0.8, colsample_bytree=0.7, scale_pos_weight=spw, random_state=RANDOM_SEED, eval_metric="logloss")),
+            ("lgbm", lgb.LGBMClassifier(n_estimators=1000, learning_rate=0.03, max_depth=6, class_weight="balanced", random_state=RANDOM_SEED, n_jobs=-1, verbosity=-1)),
+        ], voting="soft", n_jobs=-1),
     }
-
-def cross_validate(pipeline, X_train, y_train, n_splits: int = 5):
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
-    scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring="f1", n_jobs=-1)
-    return scores.mean(), scores.std(), cv
 
 
 def train_dataset_version(version: str, df: pd.DataFrame, target_model: str = None) -> dict:
-    """
-    Runs the full model-selection + final-test cycle for one dataset version.
-    Returns the best run's info (model name, run_id, test metrics).
-    """
-    X, y, preprocessor = build_preprocessor(df)
-    X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(X, y)
+    X, y = load_version_data(version)
+    print(f"  {version}: {X.shape[0]} samples, {X.shape[1]} features")
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, random_state=RANDOM_SEED, stratify=y)
+    print(f"  Train: {len(y_train)} | Test: {len(y_test)}")
 
     mlflow_utils.setup_mlflow()
-    all_models = get_model_configs(y_train)
-    
+    preprocessor = build_preprocessor_v2(X) if version == "v2" else build_preprocessor_v3(X)
+    spw = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+    all_models = get_all_models(spw)
+
     if target_model:
-        available_models = {k.lower().replace(" ", ""): k for k in all_models.keys()}
-        clean_target = target_model.lower().replace(" ", "").replace("_", "").replace("-", "")
-        
-        if clean_target in available_models:
-            actual_key = available_models[clean_target]
-            models = {actual_key: all_models[actual_key]}
-            print(f"🎯 Filtering pipeline to run ONLY: {actual_key}")
-        else:
-            print(f"❌ Model '{target_model}' not found. Running all 7 models instead.")
-            models = all_models
-    else:
-        models = all_models
+        clean = target_model.lower().replace(" ", "")
+        matches = {k.lower().replace(" ", ""): k for k in all_models}
+        if clean in matches:
+            all_models = {matches[clean]: all_models[matches[clean]]}
 
-    selection_results = []
-    fitted_pipelines = {}
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_SEED)
+    results = []
 
-    print(f"\n{'='*100}\nModel selection on '{version}' (CV on train, scored on validation)\n{'='*100}")
-    for model_name, cfg in models.items():
-        run_name = f"{model_name.lower().replace(' ', '_')}_{version}_model_selection"
-        with mlflow_utils.start_run(run_name=run_name):
-            start = time.time()
-            pipeline = Pipeline([("preprocessor", preprocessor), ("classifier", cfg["model"])])
+    # ============ Step 1: CV on train ============
+    print(f"\n{'='*80}")
+    print(f"  Step 1: 10-Fold CV on train set - Model Selection")
+    print(f"{'='*80}")
 
-            cv_mean, cv_std, cv = cross_validate(pipeline, X_train, y_train)
-            pipeline.fit(X_train, y_train)
-            fitted_pipelines[model_name] = pipeline
+    for name, model in all_models.items():
+        with mlflow_utils.start_run(run_name=f"{name.lower().replace(' ','_')}_{version}_cv"):
+            t0 = time.time()
+            pipe = Pipeline([("pre", preprocessor), ("clf", model)])
+            cv_scores = cross_val_score(pipe, X_train, y_train, cv=cv, scoring="f1", n_jobs=1)
+            cv_f1_mean = cv_scores.mean()
+            cv_f1_std = cv_scores.std()
+            oof_prob = cross_val_predict(pipe, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
+            best_thr, best_thr_f1 = find_best_threshold(y_train, oof_prob)
+            oof_pred = (oof_prob >= best_thr).astype(int)
+            cv_acc = accuracy_score(y_train, oof_pred)
+            elapsed = time.time() - t0
+            mlflow_utils.log_params_clean({"dataset_version": version, "model_name": name, "best_threshold": best_thr})
+            mlflow_utils.log_metrics({"cv_f1_mean": cv_f1_mean, "cv_f1_std": cv_f1_std, "cv_threshold_f1": best_thr_f1, "cv_accuracy": cv_acc})
+            print(f"  {name:<22} CV-F1={cv_f1_mean:.4f}(+/-{cv_f1_std:.4f}) Thr-F1={best_thr_f1:.4f} Acc={cv_acc:.4f} thr={best_thr:.2f} [{elapsed:.0f}s]")
+            results.append({"model": name, "cv_f1": cv_f1_mean, "thr_f1": best_thr_f1, "threshold": best_thr, "run_id": mlflow_utils.get_active_run_id()})
 
-            val_pred = pipeline.predict(X_val)
-            val_prob = pipeline.predict_proba(X_val)[:, 1]
-            val_metrics = evaluate.compute_metrics(y_val, val_pred, val_prob)
-            elapsed = time.time() - start
+    # ============ Step 2: Pick best ============
+    best = max(results, key=lambda r: r["thr_f1"])
+    best_name, best_thr = best["model"], best["threshold"]
+    print(f"\n  Best model: {best_name} (CV Thr-F1={best['thr_f1']:.4f})")
 
-            mlflow_utils.log_params_clean({
-                "dataset_version": version, "model_name": model_name, "model_type": cfg["type"],
-                "random_seed": RANDOM_SEED, "stage": "model_selection",
-                "train_samples": len(X_train), "val_samples": len(X_val), "n_features": X_train.shape[1],
-            })
-            mlflow_utils.log_metrics({
-                "cv_f1_mean": cv_mean, "cv_f1_std": cv_std,
-                "val_accuracy": val_metrics["accuracy"], "val_precision": val_metrics["precision"],
-                "val_recall": val_metrics["recall"], "val_f1": val_metrics["f1"],
-                "val_roc_auc": val_metrics["roc_auc"], "training_time_sec": elapsed,
-            })
+    # ============ Step 3: Fit on full train ============
+    print(f"\n{'='*80}")
+    print(f"  Step 2: Fitting {best_name} on full train set...")
+    print(f"{'='*80}")
+    final_pipe = Pipeline([("pre", preprocessor), ("clf", all_models[best_name])])
+    final_pipe.fit(X_train, y_train)
 
-            print(f"{version:<4} {model_name:<22} CV-F1={cv_mean:.4f} Val-F1={val_metrics['f1']:.4f}")
-            selection_results.append({
-                "dataset_version": version, "model": model_name, "cv_f1": cv_mean,
-                "val_f1": val_metrics["f1"], "run_id": mlflow_utils.get_active_run_id(),
-            })
+    # ============ Step 4: Train results ============
+    print(f"\n{'='*80}")
+    print(f"  Step 3: Train Results - {best_name} ({version})")
+    print(f"{'='*80}")
+    train_prob = final_pipe.predict_proba(X_train)[:, 1]
+    train_pred = (train_prob >= best_thr).astype(int)
+    tr_cm = confusion_matrix(y_train, train_pred)
+    tr_acc = accuracy_score(y_train, train_pred)
+    tr_prec = precision_score(y_train, train_pred)
+    tr_rec = recall_score(y_train, train_pred)
+    tr_f1 = f1_score(y_train, train_pred)
+    tr_auc = roc_auc_score(y_train, train_prob)
+    print(f"  Accuracy:  {tr_acc:.4f}")
+    print(f"  Precision: {tr_prec:.4f}")
+    print(f"  Recall:    {tr_rec:.4f}")
+    print(f"  F1 Score:  {tr_f1:.4f}")
+    print(f"  ROC AUC:   {tr_auc:.4f}")
+    print(f"  Threshold: {best_thr:.2f}")
+    print(f"  Confusion Matrix: TN={tr_cm[0,0]} FP={tr_cm[0,1]} FN={tr_cm[1,0]} TP={tr_cm[1,1]}")
 
-    # Pick the best model using VALIDATION performance only (test is untouched so far)
-    best = max(selection_results, key=lambda r: r["val_f1"])
-    best_model_name = best["model"]
-    best_pipeline = fitted_pipelines[best_model_name]
-    best_cfg = models[best_model_name]
+    # ============ Step 5: Test results ============
+    print(f"\n{'='*80}")
+    print(f"  Step 4: Test Results - {best_name} ({version})")
+    print(f"{'='*80}")
+    test_prob = final_pipe.predict_proba(X_test)[:, 1]
+    test_pred = (test_prob >= best_thr).astype(int)
+    cm = confusion_matrix(y_test, test_pred)
+    acc = accuracy_score(y_test, test_pred)
+    prec = precision_score(y_test, test_pred)
+    rec = recall_score(y_test, test_pred)
+    f1 = f1_score(y_test, test_pred)
+    auc = roc_auc_score(y_test, test_prob)
+    print(f"  Accuracy:  {acc:.4f}")
+    print(f"  Precision: {prec:.4f}")
+    print(f"  Recall:    {rec:.4f}")
+    print(f"  F1 Score:  {f1:.4f}")
+    print(f"  ROC AUC:   {auc:.4f}")
+    print(f"  Threshold: {best_thr:.2f}")
+    print(f"  Confusion Matrix: TN={cm[0,0]} FP={cm[0,1]} FN={cm[1,0]} TP={cm[1,1]}")
+    print(f"{'='*80}")
 
-    print(f"\nBest on validation for '{version}': {best_model_name} (val_f1={best['val_f1']:.4f})")
-    print("Running the SINGLE final evaluation on the untouched TEST set...")
+    # ============ Step 6: Save model locally + MLflow charts ============
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    model_path = os.path.join(MODELS_DIR, f"churn_{version}.joblib")
+    joblib.dump(final_pipe, model_path)
+    print(f"\n  Model saved: {model_path}")
 
-    with mlflow_utils.start_run(run_name=f"{best_model_name.lower().replace(' ', '_')}_{version}_FINAL_TEST"):
-        test_pred = best_pipeline.predict(X_test)
-        test_prob = best_pipeline.predict_proba(X_test)[:, 1]
-        test_metrics = evaluate.compute_metrics(y_test, test_pred, test_prob)
-        cm = evaluate.get_confusion_matrix(y_test, test_pred)
+    info = {
+        "model_name": best_name, "dataset_version": version,
+        "best_threshold": best_thr, "features": list(X.columns),
+        "train": {"accuracy": tr_acc, "precision": tr_prec, "recall": tr_rec, "f1": tr_f1, "roc_auc": tr_auc},
+        "test": {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "roc_auc": auc},
+    }
+    info_path = os.path.join(MODELS_DIR, f"churn_{version}_info.json")
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2)
+    print(f"  Info saved: {info_path}")
 
-        mlflow_utils.log_params_clean({
-            "dataset_version": version, "model_name": best_model_name, "model_type": best_cfg["type"],
-            "random_seed": RANDOM_SEED, "stage": "final_test", "test_samples": len(X_test),
-        })
+    with mlflow_utils.start_run(run_name=f"{best_name.lower().replace(' ','_')}_{version}_FINAL"):
+        mlflow_utils.log_params_clean({"dataset_version": version, "model_name": best_name, "best_threshold": best_thr})
         mlflow_utils.log_metrics({
-            "test_accuracy": test_metrics["accuracy"], "test_precision": test_metrics["precision"],
-            "test_recall": test_metrics["recall"], "test_f1": test_metrics["f1"],
-            "test_roc_auc": test_metrics["roc_auc"],
+            "train_accuracy": tr_acc, "train_f1": tr_f1,
+            "test_accuracy": acc, "test_precision": prec, "test_recall": rec, "test_f1": f1, "test_roc_auc": auc,
         })
         mlflow_utils.log_confusion_matrix(cm)
-        mlflow_utils.log_model(best_pipeline.named_steps["classifier"], best_cfg["type"],
-                                artifact_name=f"{best_model_name.lower().replace(' ', '_')}_{version}")
-        evaluate.plot_confusion_matrix(cm, f"{best_model_name} — {version} (test)",
-                                        save_as=f"confusion_matrix_{version}.png")
+        mlflow_utils.log_figure(evaluate.plot_confusion_matrix(cm, f"{best_name} ({version}) - Test"), "confusion_matrix.png")
+        mlflow_utils.log_figure(evaluate.plot_roc_curve(y_test, test_prob, f"ROC ({best_name})"), "roc_curve.png")
+        mlflow_utils.log_figure(evaluate.plot_precision_recall_curve(y_test, test_prob, f"PR ({best_name})"), "precision_recall_curve.png")
+        fi = evaluate.plot_feature_importance(final_pipe, list(X.columns), f"Features ({best_name})")
+        if fi: mlflow_utils.log_figure(fi, "feature_importance.png")
+        evaluate.plot_confusion_matrix(cm, f"{best_name} ({version}) - Test", save_as=f"confusion_matrix_{version}.png")
+        final_id = mlflow_utils.get_active_run_id()
 
-        final_run_id = mlflow_utils.get_active_run_id()
-
-    print(f"FINAL test metrics [{version}] {best_model_name}: {test_metrics}")
+    print(f"\n  MLflow run: {final_id} — run 'mlflow ui' to see charts.\n")
 
     return {
-        "dataset_version": version,
-        "model": best_model_name,
-        "run_id": final_run_id,
-        "val_f1": best["val_f1"],
-        **{f"test_{k}": v for k, v in test_metrics.items()},
-        "selection_results": selection_results,
+        "dataset_version": version, "model": best_name, "run_id": final_id,
+        "best_threshold": best_thr, "cv_f1": best["cv_f1"], "cv_thr_f1": best["thr_f1"],
+        "train_accuracy": tr_acc, "train_f1": tr_f1,
+        "test_accuracy": acc, "test_precision": prec, "test_recall": rec, "test_f1": f1, "test_roc_auc": auc,
+        "selection_results": results,
     }
